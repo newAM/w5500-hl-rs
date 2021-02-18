@@ -448,7 +448,7 @@ pub trait Udp<E>: Registers<Error = E> {
         Ok((usize::from(pkt_size), origin))
     }
 
-    /// Sends data on the socket to the given address.
+    /// Sends data to the given address.
     /// On success, returns the number of bytes written.
     ///
     /// # Comparison to [`std::net::UdpSocket::send_to`]
@@ -486,10 +486,57 @@ pub trait Udp<E>: Registers<Error = E> {
         self.udp_send(socket, buf)
     }
 
+    /// Sends all data to the given address.
+    ///
+    /// Compared to [`udp_send_to`] this returns [`nb::Error::WouldBlock`] if
+    /// there is not enough room in the transmit buffer for `buf`.
+    ///
+    /// If this method returns [`nb::Error::WouldBlock`] the socket destination
+    /// will be set, and subsequent calls may use [`udp_send_all`] to attempt to
+    /// send data to the same destination.
+    ///
+    /// If `buf` is larger than the configured socket buffer size this method
+    /// will always return [`nb::Error::WouldBlock`].
+    ///
+    /// # Panics
+    ///
+    /// * (debug) The socket must be opened as a UDP socket.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use embedded_hal_mock as h;
+    /// # let mut w5500 = w5500_ll::blocking::vdm::W5500::new(h::spi::Mock::new(&[]), h::pin::Mock::new(&[]));
+    /// use nb::block;
+    /// use w5500_hl::{
+    ///     ll::{Registers, Socket::Socket0},
+    ///     net::{Ipv4Addr, SocketAddrV4},
+    ///     Udp,
+    /// };
+    ///
+    /// const DEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 8081);
+    ///
+    /// w5500.udp_bind(Socket0, 8080)?;
+    /// let buf: [u8; 10] = [0; 10];
+    /// block!(w5500.udp_send_all_to(Socket0, &buf, &DEST))?;
+    /// # Ok::<(), w5500_hl::ll::blocking::vdm::Error<_, _>>(())
+    /// ```
+    ///
+    /// [`udp_send_all`]: Udp::udp_send_all
+    fn udp_send_all_to(
+        &mut self,
+        socket: Socket,
+        buf: &[u8],
+        addr: &SocketAddrV4,
+    ) -> nb::Result<(), E> {
+        self.set_sn_dest(socket, addr)?;
+        self.udp_send_all(socket, buf)
+    }
+
     /// Sends data to the currently configured destination.
     ///
-    /// The destination is set by the last call to [`set_sn_dest`] or
-    /// [`send_to`].
+    /// The destination is set by the last call to [`set_sn_dest`],
+    /// [`udp_send_to`], or [`udp_send_all_to`].
     ///
     /// # Panics
     ///
@@ -519,7 +566,9 @@ pub trait Udp<E>: Registers<Error = E> {
     /// ```
     ///
     /// [`set_sn_dest`]: w5500_ll::Registers::set_sn_dest
-    /// [`send_to`]: Udp::udp_send_to
+    /// [`udp_send_to`]: Udp::udp_send_to
+    /// [`udp_send_all_to`]: Udp::udp_send_all_to
+    /// [`udp_send`]: Udp::udp_send
     fn udp_send(&mut self, socket: Socket, buf: &[u8]) -> Result<usize, E> {
         debug_assert_eq!(self.sn_sr(socket)?, Ok(SocketStatus::Udp));
 
@@ -533,6 +582,67 @@ pub trait Udp<E>: Registers<Error = E> {
             self.set_sn_cr(socket, SocketCommand::Send)?;
         }
         Ok(usize::from(tx_bytes))
+    }
+
+    /// Sends all data to the currently configured destination.
+    ///
+    /// Compared to [`udp_send`] this returns [`nb::Error::WouldBlock`] if
+    /// there is not enough room in the transmit buffer for `buf`.
+    ///
+    /// The destination is set by the last call to [`set_sn_dest`],
+    /// [`udp_send_to`], or [`udp_send_all_to`].
+    ///
+    /// If `buf` is larger than the configured socket buffer size this method
+    /// will always return [`nb::Error::WouldBlock`].
+    ///
+    /// # Panics
+    ///
+    /// * (debug) The socket must be opened as a UDP socket.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use embedded_hal_mock as h;
+    /// # let mut w5500 = w5500_ll::blocking::vdm::W5500::new(h::spi::Mock::new(&[]), h::pin::Mock::new(&[]));
+    /// use nb::block;
+    /// use w5500_hl::{
+    ///     ll::{Registers, Socket::Socket0},
+    ///     net::{Ipv4Addr, SocketAddrV4},
+    ///     Udp,
+    /// };
+    ///
+    /// const DEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 8081);
+    ///
+    /// w5500.set_sn_dest(Socket0, &DEST)?;
+    /// w5500.udp_bind(Socket0, 8080)?;
+    ///
+    /// // send to the previously configured destination
+    /// let buf: [u8; 10] = [0; 10];
+    /// block!(w5500.udp_send_all(Socket0, &buf))?;
+    /// # Ok::<(), w5500_hl::ll::blocking::vdm::Error<_, _>>(())
+    /// ```
+    ///
+    /// [`set_sn_dest`]: w5500_ll::Registers::set_sn_dest
+    /// [`udp_send_to`]: Udp::udp_send_to
+    /// [`udp_send_all_to`]: Udp::udp_send_all_to
+    /// [`udp_send`]: Udp::udp_send
+    fn udp_send_all(&mut self, socket: Socket, buf: &[u8]) -> nb::Result<(), E> {
+        debug_assert_eq!(self.sn_sr(socket)?, Ok(SocketStatus::Udp));
+
+        let free_size: u16 = self.sn_tx_fsr(socket)?;
+        if usize::from(free_size) < buf.len() {
+            return Err(nb::Error::WouldBlock);
+        }
+
+        let data_len: u16 = u16::try_from(buf.len()).unwrap_or(u16::MAX);
+        let tx_bytes: u16 = min(data_len, free_size);
+        if tx_bytes != 0 {
+            let ptr: u16 = self.sn_tx_wr(socket)?;
+            self.set_sn_tx_buf(socket, ptr, &buf[..usize::from(tx_bytes)])?;
+            self.set_sn_tx_wr(socket, ptr.wrapping_add(tx_bytes))?;
+            self.set_sn_cr(socket, SocketCommand::Send)?;
+        }
+        Ok(())
     }
 }
 

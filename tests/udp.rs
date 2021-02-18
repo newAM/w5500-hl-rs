@@ -74,8 +74,9 @@ mod socket_status_debug_assert {
     }
 }
 
-/// Tests blocking UDP functions return nb::WouldBlock
-mod udp_would_block_header {
+/// Tests blocking UDP functions return nb::Error::WouldBlock when there is no
+/// header in the RX buffer.
+mod would_block_header {
     use super::*;
 
     struct MockRegisters {}
@@ -126,8 +127,112 @@ mod udp_would_block_header {
     }
 }
 
+/// Tests `send_all` UDP functions return nb::Error::WouldBlock if there is not
+/// enough room in the transmit buffer for all data.
+mod would_block_send_all {
+    use super::*;
+
+    const SOCKET: Socket = Socket::Socket4;
+    const DEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 2, 0), 8082);
+
+    struct MockRegisters {
+        dest: Vec<SocketAddrV4>,
+        fsr: u16,
+    }
+
+    impl Registers for MockRegisters {
+        type Error = Infallible;
+
+        fn set_sn_dest(&mut self, socket: Socket, addr: &SocketAddrV4) -> Result<(), Self::Error> {
+            assert_eq!(socket, SOCKET);
+            let expected = self.dest.pop().expect("Unexpected call to set_sn_dest");
+            assert_eq!(&expected, addr);
+            Ok(())
+        }
+
+        fn sn_tx_fsr(&mut self, socket: Socket) -> Result<u16, Self::Error> {
+            assert_eq!(socket, SOCKET);
+            Ok(self.fsr)
+        }
+
+        fn sn_sr(&mut self, socket: Socket) -> Result<Result<SocketStatus, u8>, Self::Error> {
+            assert_eq!(socket, SOCKET);
+            Ok(Ok(SocketStatus::Udp))
+        }
+
+        fn read(&mut self, _address: u16, _block: u8, _data: &mut [u8]) -> Result<(), Self::Error> {
+            unimplemented!()
+        }
+
+        fn write(&mut self, _address: u16, _block: u8, _data: &[u8]) -> Result<(), Self::Error> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn fsr_zero() {
+        let buf: [u8; 1] = [0];
+
+        let mut mock = MockRegisters {
+            dest: vec![],
+            fsr: 0,
+        };
+        assert_eq!(mock.udp_send_all(SOCKET, &buf), Err(nb::Error::WouldBlock));
+
+        let mut mock = MockRegisters {
+            dest: vec![DEST],
+            fsr: 0,
+        };
+        assert_eq!(
+            mock.udp_send_all_to(SOCKET, &buf, &DEST),
+            Err(nb::Error::WouldBlock)
+        );
+        assert!(mock.dest.is_empty());
+    }
+
+    #[test]
+    fn never_block() {
+        let buf: [u8; 0] = [];
+
+        let mut mock = MockRegisters {
+            dest: vec![],
+            fsr: 0,
+        };
+        mock.udp_send_all(SOCKET, &buf).unwrap();
+
+        let mut mock = MockRegisters {
+            dest: vec![DEST],
+            fsr: 0,
+        };
+        mock.udp_send_all_to(SOCKET, &buf, &DEST).unwrap();
+        assert!(mock.dest.is_empty());
+    }
+
+    #[test]
+    fn always_block() {
+        let buf: [u8; 2049] = [0; 2049];
+        const FSR: u16 = 2048;
+
+        let mut mock = MockRegisters {
+            dest: vec![],
+            fsr: FSR,
+        };
+        assert_eq!(mock.udp_send_all(SOCKET, &buf), Err(nb::Error::WouldBlock));
+
+        let mut mock = MockRegisters {
+            dest: vec![DEST],
+            fsr: FSR,
+        };
+        assert_eq!(
+            mock.udp_send_all_to(SOCKET, &buf, &DEST),
+            Err(nb::Error::WouldBlock)
+        );
+        assert!(mock.dest.is_empty());
+    }
+}
+
 /// Tests the udp_bind method
-mod udp_bind {
+mod bind {
     use super::*;
 
     const TEST_SOCKET: Socket = Socket::Socket7;
